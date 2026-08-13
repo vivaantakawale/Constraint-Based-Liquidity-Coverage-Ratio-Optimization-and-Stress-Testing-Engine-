@@ -1,7 +1,7 @@
-ortools>=9.15
-pandas>=3.0
-numpy>=2.5
-streamlit>=1.60
-requests>=2.34
-pytest>=9.1
-plotly>=6.9
+ortools==9.15.6755
+pandas==3.0.5
+numpy==2.5.1
+streamlit==1.60.0
+requests==2.34.2
+pytest==9.1.1
+plotly==6.9.0
