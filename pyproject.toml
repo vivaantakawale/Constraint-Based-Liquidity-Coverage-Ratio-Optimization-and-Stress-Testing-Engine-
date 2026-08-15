@@ -1,10 +1,37 @@
 [project]
 name = "lcr-optimizer"
 version = "0.1.0"
+description = "Basel III LCR-constrained HQLA portfolio optimizer (OR-Tools CP-SAT), run against JPMorgan Chase's real quarterly LCR disclosures."
+readme = "README.md"
 requires-python = ">=3.10"
+
+dependencies = [
+    "ortools>=9.15",
+    "pandas>=3.0",
+    "numpy>=2.5",
+    "streamlit>=1.60",
+    "requests>=2.34",
+    "plotly>=6.9",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=9.1",
+    "pytest-cov>=6.0",
+    "ruff>=0.8",
+]
 
 [tool.setuptools.packages.find]
 where = ["src"]
+
+[tool.ruff]
+line-length = 120
+
+[tool.ruff.lint]
+# E9/F: syntax errors + pyflakes (unused imports, undefined names)
+# B: bugbear - catches real bug classes (mutable defaults, bad comparisons)
+# I: import sorting/grouping, for consistency
+select = ["E9", "F", "B", "I"]
 
 [build-system]
 requires = ["setuptools>=68"]
