@@ -1,32 +1,32 @@
 """
 Stress scenario layer.
 
-IMPORTANT CAVEAT (read this before citing scenario numbers as "Basel"):
-the BCBS238 run-off/inflow rates already ARE a stress calibration -- the
-whole point of the LCR is that the denominator represents a 30-day acute
-stress, not business-as-usual. Basel does not publish a second, more severe
-"scenario B" set of rates the way this module does. The scenarios below are
-a modeling extension on top of the regulatory baseline, meant to answer "how
-does the optimal portfolio and its cost shift if the stress is *worse* than
-the regulatory minimum calibration assumes" -- which is a reasonable and
-common thing for a bank's own internal liquidity stress testing (ILST) to
-do, but it is our own severity layer, not a BCBS-specified one. Say this
-explicitly if asked in an interview.
+CAVEAT: BCBS238 rates already ARE a stress calibration -- Basel doesn't
+publish a second "scenario B" rate set. Scenarios below extend the
+regulatory baseline (like a bank's own internal liquidity stress test
+would), not a BCBS-specified severity layer -- flag this if asked.
 
-Tier haircuts (15%/25%/50%) are NOT shocked here, since those are fixed
-regulatory constants applied regardless of scenario -- only outflow/inflow
-run-off rates are overridden, which is the mechanism Basel itself uses to
-represent stress.
+Tier haircuts (15%/25%/50%) NOT shocked -- fixed regulatory constants.
+Only outflow/inflow rates overridden, matching Basel's own stress mechanism.
 """
 
 from dataclasses import dataclass, field, replace
+from typing import TYPE_CHECKING
 
-from .data import build_outflow_profile, build_inflow_profile, net_cash_outflows
+from .data import build_inflow_profile, build_outflow_profile, net_cash_outflows
 from .model import OptimizerConfig, solve
+
+if TYPE_CHECKING:
+    import pandas
 
 
 @dataclass
 class Scenario:
+    """One named stress scenario, synthetic bank.
+    name: str, label. description: str. outflow_rate_overrides: dict[str,float],
+    category key -> replacement absolute rate, default {} (baseline).
+    inflow_rate_overrides: dict[str,float], same shape.
+    """
     name: str
     description: str
     outflow_rate_overrides: dict = field(default_factory=dict)
@@ -94,29 +94,41 @@ ALL_SCENARIOS = [BASELINE, DEPOSIT_RUN, WHOLESALE_FREEZE, COMBINED_2008]
 
 
 class _OverriddenLine:
-    """Wraps an OutflowLine/InflowLine so `.rate` reflects a scenario override
-    while everything else (name, balance) passes through unchanged."""
+    """Wraps OutflowLine/InflowLine so `.rate` reflects scenario override,
+    rest (name, balance) passthrough.
+    Args (constructor): line: OutflowLine|InflowLine. overrides: dict[str,float].
+    """
     def __init__(self, line, overrides):
         self._line = line
         self._overrides = overrides
 
     def __getattr__(self, item):
+        """Passthrough for non-overridden attributes. Args: item: str. Returns: attribute value."""
         return getattr(self._line, item)
 
     @property
     def rate(self):
+        """Returns float -- override rate for category if present, else baseline rate."""
         return self._overrides.get(self._line.category, self._line.rate)
 
     @property
     def stressed_outflow(self):
+        """Returns float $mm = balance * rate."""
         return self._line.balance * self.rate
 
     @property
     def stressed_inflow(self):
+        """Returns float $mm = balance * rate."""
         return self._line.balance * self.rate
 
 
 def run_scenario(scenario: Scenario, assets, base_config: OptimizerConfig):
+    """Solves one scenario against synthetic bank's outflow/inflow profile.
+    Args: scenario: Scenario. assets: list[Asset]. base_config: OptimizerConfig --
+      net_cash_outflows overwritten with computed NCO before solving (base_config untouched).
+    Returns: dict -- scenario: str, description: str, net_cash_outflows_mm: float,
+      nco_detail: dict, result: model.OptimizationResult.
+    """
     outflows = [_OverriddenLine(o, scenario.outflow_rate_overrides) for o in build_outflow_profile()]
     inflows = [_OverriddenLine(i, scenario.inflow_rate_overrides) for i in build_inflow_profile()]
     nco_detail = net_cash_outflows(outflows, inflows)
@@ -135,11 +147,21 @@ def run_scenario(scenario: Scenario, assets, base_config: OptimizerConfig):
 
 
 def run_all_scenarios(assets, base_config: OptimizerConfig, scenarios=None):
+    """Runs run_scenario() over list of scenarios.
+    Args: assets: list[Asset]. base_config: OptimizerConfig.
+      scenarios: list[Scenario]|None, defaults to ALL_SCENARIOS.
+    Returns: list[dict], one run_scenario() result per scenario, input order.
+    """
     scenarios = scenarios or ALL_SCENARIOS
     return [run_scenario(s, assets, base_config) for s in scenarios]
 
 
 def summarize_scenarios(scenario_results: list) -> "pandas.DataFrame":
+    """Flattens run_all_scenarios() output into display table.
+    Args: scenario_results: list[dict].
+    Returns: pandas.DataFrame, one row/scenario -- Scenario, Net Cash Outflows ($mm), Status,
+      Total HQLA ($mm), LCR (%), Annual Cost ($mm), L1/L2A/L2B ($mm); numeric cols None if not OPTIMAL.
+    """
     import pandas as pd
     rows = []
     for sr in scenario_results:
