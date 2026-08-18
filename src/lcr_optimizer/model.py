@@ -1,43 +1,23 @@
 """
-Core LCR optimizer: minimum-cost HQLA portfolio subject to Basel III LCR >= 100%.
+Core LCR optimizer: minimum cost HQLA portfolio, Basel III LCR >= 100%
 
-SOLVER CHOICE: OR-Tools CP-SAT, not the MPSolver LP/MIP interface.
-------------------------------------------------------------------
-Why CP-SAT over a classic MIP solver (CBC/SCIP via MPSolver):
+SOLVER: OR-Tools CP-SAT, not MPSolver LP/MIP
+    Why:
+1. Lot sizes, concentration caps, cash floor are integer/combinatorial.
+   CP-SAT's reified constraints (OnlyEnforceIf) avoid the big-M formulation
+   a classic MIP would need for "if held, hold >= N lots" logic -- big-M is
+   numerically fragile (bad M cuts off feasible solutions or wrecks the
+   LP bound).
+2. CP-SAT's search tends to close coupled-cap MIPs (L2 <= 40% of a total
+   that includes L2, etc.) faster than branch-and-bound.
+3. Trade-off: pure integer solver, no LP dual values/shadow prices --
+   coefficients scaled to integer (SCALE below); see model_lp.py for the
+   separate continuous solve that gives shadow prices.
 
-1. The realism constraints the brief asks for -- minimum lot sizes,
-   single-issuer concentration limits, a cash floor -- are naturally
-   integer/combinatorial (lot counts), not continuous. CP-SAT is built
-   for exactly this: integer decision variables with linear constraints
-   over them, plus first-class reified/indicator constraints
-   (`OnlyEnforceIf`) if we later want "if you hold this bond at all, hold
-   at least N lots of it" logic -- that needs a big-M formulation in a
-   pure LP/MIP model, which is numerically fragile (a badly-chosen M
-   either cuts off feasible solutions or wrecks the LP relaxation's
-   bound). CP-SAT's reified constraints avoid big-M entirely.
-2. CP-SAT's lazy-clause/CP-based search tends to close combinatorial
-   MIPs (cardinality limits, this-or-that issuer choices) faster than a
-   branch-and-bound LP relaxation does, especially once the model has
-   several coupled cap constraints like ours (L2 <= 40% of a total that
-   includes L2, etc.).
-3. Trade-off, stated up front: CP-SAT is a pure integer solver, so every
-   coefficient here is scaled to an integer (see SCALE below), and CP-SAT
-   does not give you LP dual values / shadow prices the way MPSolver's
-   GLOP would. If a future ask is "what's the marginal cost of the LCR
-   requirement" (a shadow-price question), that's a reason to add a
-   continuous LP-relaxation solve via MPSolver alongside this model --
-   not implemented in v1 since it wasn't asked for.
-
-SCALING: CP-SAT requires integer coefficients in every linear expression.
-Haircuts, run-off rates, yields, and caps are all real-valued (e.g. 15%,
-4.2%), so every rate is scaled by SCALE and rounded to the nearest integer
-before being used in a constraint. SCALE = 1,000,000 gives sub-basis-point
-precision, far finer than any of these regulatory rates are specified to,
-so the rounding error is immaterial. Composition caps (40%, 15%, single-
-issuer limits) are instead cleared with an exact integer cross-multiplication
-(e.g. "L2 <= 40% of total" becomes "60*L2 <= 40*L1") wherever the cap is a
-clean fraction -- that avoids compounding rounding error on top of the
-haircut scaling.
+SCALING: CP-SAT needs integer coefficients. Rates/haircuts/yields scaled by
+SCALE (1,000,000, sub-basis-point precision) and rounded. Composition caps
+cleared via exact integer cross-multiplication ("L2<=40%" -> "60*L2<=40*L1")
+to avoid compounding rounding error.
 """
 
 from dataclasses import dataclass, field
@@ -53,38 +33,52 @@ SCALE = 1_000_000
 
 @dataclass
 class OptimizerConfig:
-    net_cash_outflows: float          # $mm, required NCO to cover (LCR denominator)
-    cash_floor: float = 0.0            # $mm, minimum Level-1 cash/CB-reserves holding
-    issuer_concentration_cap: Optional[float] = None  # e.g. 0.25 => no issuer > 25% of total HQLA
-    benchmark_yield: float = 0.085     # annualized, used for opportunity-cost objective
+    """Inputs to build_model()/solve(). Dollar figures in $mm.
+    net_cash_outflows: float, required NCO (LCR denominator).
+    cash_floor: float, min L1 cash held, default 0.0.
+    issuer_concentration_cap: float|None, e.g. 0.25 = no issuer > 25% of HQLA, default None.
+    benchmark_yield: float decimal, opportunity-cost baseline, default 0.085.
+    time_limit_seconds: float, CP-SAT time budget, default 10.0.
+    contingent_liquidity_mm: float, non-LCR-eligible fallback liquidity (FHLB/discount-window,
+      excess unencumbered securities). Used only by _diagnose_infeasibility() -- never enters
+      the actual LCR constraint. Default 0.0, no-op.
+    """
+    net_cash_outflows: float
+    cash_floor: float = 0.0
+    issuer_concentration_cap: Optional[float] = None
+    benchmark_yield: float = 0.085
     time_limit_seconds: float = 10.0
-    # $mm of non-LCR-eligible fallback liquidity (e.g. FHLB/discount-window
-    # borrowing capacity, excess unencumbered securities) a bank could draw
-    # on in a real stress but that does NOT count toward the LCR numerator.
-    # Used ONLY by _diagnose_infeasibility() to answer a distinct question
-    # ("is the bank operationally out of liquidity, or just out of
-    # *LCR-eligible* liquidity") -- it never enters build_model()/solve()'s
-    # actual LCR constraint, so it can never turn a genuine regulatory
-    # INFEASIBLE into a false OPTIMAL. Default 0.0 is a no-op (existing
-    # callers that never set this get byte-identical diagnostics to before).
     contingent_liquidity_mm: float = 0.0
 
 
 @dataclass
 class AssetResult:
+    """One asset's allocation in solved OptimizationResult.
+    name/tier/issuer: str, copied from source Asset. lots: int, lots held.
+    amount_mm: float, $mm = lots*min_lot. adjusted_mm: float, post-haircut $mm.
+    annual_cost_mm: float $mm/yr, can be negative if yield exceeds benchmark.
+    """
     name: str
     tier: str
     issuer: str
     lots: int
     amount_mm: float
-    adjusted_mm: float          # post-haircut, HQLA-eligible value
-    annual_cost_mm: float        # opportunity cost contribution
+    adjusted_mm: float
+    annual_cost_mm: float
 
 
 @dataclass
 class OptimizationResult:
-    status: str                  # "OPTIMAL", "FEASIBLE", "INFEASIBLE", "UNKNOWN"
-    allocations: list = field(default_factory=list)   # list[AssetResult]
+    """Return value of solve().
+    status: str, "OPTIMAL"/"FEASIBLE"/"INFEASIBLE"/"UNKNOWN".
+    allocations: list[AssetResult], empty unless OPTIMAL/FEASIBLE, sorted by adjusted_mm desc.
+    total_hqla_adjusted: float $mm. lcr_pct: float, 100*total_hqla_adjusted/NCO.
+    total_annual_cost_mm: float $mm/yr. All three 0.0 if infeasible.
+    diagnostics: dict -- on success: l1/l2a/l2b_adjusted_mm (float $mm), solve_wall_time_s
+      (float sec). On infeasibility: see _diagnose_infeasibility() Returns.
+    """
+    status: str
+    allocations: list = field(default_factory=list)
     total_hqla_adjusted: float = 0.0
     lcr_pct: float = 0.0
     total_annual_cost_mm: float = 0.0
@@ -92,11 +86,21 @@ class OptimizationResult:
 
 
 def _scaled(x: float, scale: int = SCALE) -> int:
+    """Rounds real value to integer at `scale` precision (CP-SAT needs integer coefficients).
+    Args: x: float. scale: int, default SCALE (1,000,000). Returns: int.
+    """
     return round(x * scale)
 
 
 def build_model(assets: list[Asset], config: OptimizerConfig):
-    """Builds the CP-SAT model. Returns (model, vars_dict) for solving/inspection."""
+    """Builds CP-SAT model: integer lot count vars per asset, LCR/cap/floor/concentration constraints, minimize cost objective 
+    See module docstring for solver choice/scaling rationale
+
+    ARGS: assets: list[Asset]. config: OptimizerConfig.
+    RETURNS: tuple[cp_model.CpModel, dict] (model, ctx)
+    ctx: lot_vars, amount_vars, adjusted_vars (dict[str,IntVar] by asset name), 
+    total_hqla_adj, l1_adj, l2a_adj, l2b_adj (CP-SAT expressions, SCALE-scaled)
+    """
     model = cp_model.CpModel()
 
     lot_vars = {}
@@ -106,7 +110,7 @@ def build_model(assets: list[Asset], config: OptimizerConfig):
     for a in assets:
         max_available = a.available if a.available is not None else float("inf")
         if max_available == float("inf"):
-            max_lots = 10_000  # effectively unlimited for cash; keeps the domain finite for CP-SAT
+            max_lots = 10_000  # effectively unlimited for cash; keeps the domain finite for CP SAT
         else:
             max_lots = int(max_available // a.min_lot)
 
@@ -118,15 +122,17 @@ def build_model(assets: list[Asset], config: OptimizerConfig):
         amount_vars[a.name] = amount
 
         if a.is_hqla:
-            factor = _scaled(1.0 - a.haircut)  # e.g. haircut 0.15 -> 850,000
+            factor = _scaled(1.0 - a.haircut)
         else:
-            factor = 0  # non-HQLA assets never count toward the LCR numerator
+            factor = 0  # non-HQLA assets never count toward LCR numerator
         adjusted = model.NewIntVar(0, max_lots * int(a.min_lot) * SCALE, f"adj_{a.name}")
         model.Add(adjusted == amount * factor)
         adjusted_vars[a.name] = adjusted
 
-    # --- Tier aggregates ---
+    # Tier aggregates 
     def tier_sum(tier_name):
+        """Sums adjusted_vars for assets matching tier_name.
+        Args: tier_name: str. Returns: CP-SAT expression, SCALE-scaled $mm."""
         return sum(adjusted_vars[a.name] for a in assets if a.tier == tier_name)
 
     l1_adj = tier_sum("L1")
@@ -134,24 +140,24 @@ def build_model(assets: list[Asset], config: OptimizerConfig):
     l2b_adj = (tier_sum("L2B_RMBS") + tier_sum("L2B_CORP") + tier_sum("L2B_EQUITY"))
     total_hqla_adj = l1_adj + l2a_adj + l2b_adj
 
-    # --- Constraint 1: LCR >= 100%  <=>  Total HQLA (adjusted) >= Net Cash Outflows ---
+    # Constraint 1: LCR >= 100%  <=>  Total HQLA (adjusted) >= Net Cash Outflows 
     nco_scaled = _scaled(config.net_cash_outflows)
     model.Add(total_hqla_adj >= nco_scaled)
 
-    # --- Constraint 2: Level 2 (2A+2B) <= 40% of total HQLA ---
+    # Constraint 2: Level 2 (2A+2B) <= 40% of total HQLA
     # L2 <= 0.40*(L1+L2+L2B)  <=>  0.60*L2 <= 0.40*L1  <=>  60*L2 <= 40*L1  (exact, no extra rounding)
     model.Add(60 * (l2a_adj + l2b_adj) <= 40 * l1_adj)
 
-    # --- Constraint 3: Level 2B <= 15% of total HQLA ---
+    # Constraint 3: Level 2B <= 15% of total HQLA 
     # L2B <= 0.15*(L1+L2A+L2B)  <=>  0.85*L2B <= 0.15*(L1+L2A)  <=>  85*L2B <= 15*(L1+L2A)
     model.Add(85 * l2b_adj <= 15 * (l1_adj + l2a_adj))
 
-    # --- Constraint 4: minimum cash floor (Level 1 cash specifically) ---
+    # Constraint 4: minimum cash floor (Level 1 cash specifically) 
     cash_assets = [a for a in assets if a.tier == "L1" and "Cash" in a.name]
     if config.cash_floor > 0 and cash_assets:
         model.Add(sum(amount_vars[a.name] for a in cash_assets) >= int(config.cash_floor))
 
-    # --- Constraint 5 (optional): single-issuer concentration limit ---
+    # Constraint 5 (optional): single-issuer concentration limit 
     if config.issuer_concentration_cap:
         frac = Fraction(config.issuer_concentration_cap).limit_denominator(1000)
         issuers = sorted(set(a.issuer for a in assets if a.is_hqla))
@@ -160,10 +166,9 @@ def build_model(assets: list[Asset], config: OptimizerConfig):
             # issuer_adj <= cap * total  <=>  frac.denominator*issuer_adj <= frac.numerator*total
             model.Add(frac.denominator * issuer_adj <= frac.numerator * total_hqla_adj)
 
-    # --- Objective: minimize total annual opportunity cost ---
+    # Objective: minimize total annual opportunity cost
     # cost_i = (benchmark_yield - yield_i), scaled; can be negative if yield_i > benchmark
-    # (i.e. the asset is *cheaper than free* to hold -- the solver will happily max it
-    # out up to its `available` bound, which is why every asset must have a finite bound).
+
     cost_terms = []
     for a in assets:
         cost_coef = _scaled(config.benchmark_yield - a.yield_pct)
@@ -184,10 +189,17 @@ def build_model(assets: list[Asset], config: OptimizerConfig):
 
 def _diagnose_infeasibility(assets: list[Asset], config: OptimizerConfig) -> dict:
     """
-    When the primary problem is infeasible, solve a secondary problem:
-    "ignoring the NCO requirement, what's the MOST adjusted HQLA achievable
-    given available supply and the composition caps?" This turns a bare
-    INFEASIBLE into an actionable diagnostic instead of a silent failure.
+    On infeasibility solves secondary problem: 
+    "ignoring NCO, what's max adjusted HQLA achievable given supply + composition caps?" 
+    Turns bare INFEASIBLE into actionable diagnostic
+
+    ARGS: assets: list[Asset], same as solve(). config: OptimizerConfig, same as solve()
+        (net_cash_outflows ignored, sub-problem uses 0.0 instead)
+    RETURNS: dict
+    On success: max_achievable_hqla_mm, required_nco_mm, shortfall_mm (float $mm), message: str
+        If contingent_liquidity_mm > 0, adds:
+            contingent_liquidity_available_mm, contingent_liquidity_needed_mm (float $mm), contingent_liquidity_sufficient: bool, contingent_liquidity_message: str
+        If sub-problem fails: {"message": str} only
     """
     relaxed_config = OptimizerConfig(
         net_cash_outflows=0.0,
@@ -198,8 +210,8 @@ def _diagnose_infeasibility(assets: list[Asset], config: OptimizerConfig) -> dic
     )
     model, ctx = build_model(assets, relaxed_config)
     model.Maximize(ctx["total_hqla_adj"])
-    # Maximize() call above overwrites the Minimize() set inside build_model;
-    # CP-SAT only keeps the last objective set, which is what we want here.
+    # Maximize() call above overwrites Minimize() set inside build_model;
+    # CP-SAT only keeps last objective set, which is what we want
     solver = cp_model.CpSolver()
     solver.parameters.max_time_in_seconds = config.time_limit_seconds
     status = solver.Solve(model)
@@ -220,13 +232,7 @@ def _diagnose_infeasibility(assets: list[Asset], config: OptimizerConfig) -> dic
                 f"not a solver bug."
             ),
         }
-        # Secondary, clearly-separate question: is the bank operationally out
-        # of liquidity, or just out of *LCR-eligible* liquidity? This never
-        # touches the regulatory result above -- LCR stays INFEASIBLE either
-        # way, since contingent_liquidity_mm sources are excluded from
-        # eligible HQLA by definition (that's why the bank's own disclosure
-        # reports them separately). This only tells you whether the bank
-        # would survive the stress operationally, not whether it's compliant.
+
         if config.contingent_liquidity_mm > 0:
             sufficient = config.contingent_liquidity_mm >= shortfall
             diagnostics.update({
@@ -254,6 +260,11 @@ def _diagnose_infeasibility(assets: list[Asset], config: OptimizerConfig) -> dic
 
 
 def solve(assets: list[Asset], config: OptimizerConfig) -> OptimizationResult:
+    """Builds + solves CP-SAT model for minimum-cost HQLA allocation. Main entry point.
+    Args: assets: list[Asset]. config: OptimizerConfig.
+    Returns: OptimizationResult. If infeasible: allocations empty, diagnostics from
+      _diagnose_infeasibility() instead.
+    """
     model, ctx = build_model(assets, config)
     solver = cp_model.CpSolver()
     solver.parameters.max_time_in_seconds = config.time_limit_seconds
