@@ -1,13 +1,7 @@
 """
-Validation suite for model_lp.py -- the LP relaxation / shadow-price layer.
-
-test_lp_relaxation_matches_hand_computed_dual is the important one: it
-extends the exact same hand-derivable 2-asset case used in
-test_model.py::test_hand_computed_two_asset (see that docstring for the
-full derivation) one step further, to the dual value on the LCR
-constraint. That dual is this module's entire reason to exist, so it gets
-the same standard of proof as the MIP formulation itself: pencil-and-paper
-first, code second.
+Validation suite for model_lp.py -- LP relaxation / shadow-price layer
+test_lp_relaxation_dual_value_matches_hand_derivation is key: 
+extends 2-asset hand-derivable case (test_model.py) to the LCR dual value
 """
 
 import pytest
@@ -25,14 +19,8 @@ from lcr_optimizer.model_lp import solve_lp_relaxation
 
 
 def test_lp_relaxation_matches_hand_computed_two_asset():
-    """
-    Same setup as test_model.py::test_hand_computed_two_asset (see that
-    docstring for the derivation of C=51, B=40, cost=5.735). The LP
-    relaxation of this particular problem happens to have an integer
-    optimum (51 and 40 are already integers), so the LP and MIP solutions
-    should coincide exactly here -- confirms the LP formulation is
-    equivalent to the MIP's, not just "close."
-    """
+    """Same setup as test_model.py hand-derivation (C=51, B=40, cost=5.735)
+    LP relaxation happens to have integer optimum LP/MIP should coincide exactly, confirming formulations are equivalent"""
     assets = [
         Asset("Cash", "L1", "central_bank", 0.00, "fixed", min_lot=1.0, available=float("inf")),
         Asset("L2A Bond", "L2A", "IssuerX", 0.05, "synthetic", min_lot=1.0, available=1000),
@@ -50,18 +38,10 @@ def test_lp_relaxation_matches_hand_computed_two_asset():
 
 def test_lp_relaxation_dual_value_matches_hand_derivation():
     """
-    Hand derivation (same 2-asset setup as above): at the optimum, both
-    the LCR constraint and the 40% L2 composition cap are simultaneously
-    binding:
-      C + 0.85B = NCO                    (LCR binding)
-      0.60*(0.85B) = 0.40*C  =>  C = 1.275B   (L2 cap binding)
-    Differentiating both w.r.t. NCO (marginal analysis):
-      dC/dNCO = 1.275 * dB/dNCO
-      dC/dNCO + 0.85*dB/dNCO = 1  =>  (1.275+0.85)*dB/dNCO = 1
-      dB/dNCO = 1/2.125,  dC/dNCO = 1.275/2.125 = 0.6
-    Marginal cost = d(0.085C + 0.035B)/dNCO
-                  = 0.085*0.6 + 0.035*(1/2.125)
-                  = 0.051 + 0.016470588... = 0.067470588... $mm/yr per $mm NCO
+    Derivation (same 2-asset setup): at optimum, LCR + 40% L2 cap both bind:
+      C + 0.85B = NCO; C = 1.275B
+    Differentiate w.r.t. NCO: dB/dNCO=1/2.125, dC/dNCO=1.275/2.125=0.6
+    Marginal cost = 0.085*0.6 + 0.035*(1/2.125) = 0.067470588... $mm/yr per $mm NCO
     """
     assets = [
         Asset("Cash", "L1", "central_bank", 0.00, "fixed", min_lot=1.0, available=float("inf")),
@@ -75,12 +55,9 @@ def test_lp_relaxation_dual_value_matches_hand_derivation():
 
 
 def test_lp_objective_is_lower_bound_on_mip():
-    """
-    LP relaxation drops integrality, so its optimal cost can only be <=
-    the MIP's true integer optimum -- never strictly greater. Checked on
-    the full 16-asset synthetic universe (not the toy 2-asset case, which
-    happens to have zero integrality gap and wouldn't catch a violation of
-    this bound)."""
+    """LP cost <= MIP cost always (relaxed integrality)
+    Checked on full 16-asset universe 
+    toy 2-asset case has zero gap, wouldn't catch violation"""
     outflows = build_outflow_profile()
     inflows = build_inflow_profile()
     nco = net_cash_outflows(outflows, inflows)["net_cash_outflows"]
@@ -98,14 +75,8 @@ def test_lp_objective_is_lower_bound_on_mip():
 
 
 def test_lp_relaxation_infeasible_matches_mip_infeasible():
-    """
-    The LP relaxation must agree with the MIP on feasibility for an
-    absurdly large NCO -- this specifically guards against the "unbounded"
-    (available=inf) asset cap being defined inconsistently between the two
-    solvers (model.py caps it at 10,000 lots; model_lp.py must use the
-    exact same convention, or the LP could wrongly report OPTIMAL for an
-    NCO the MIP correctly reports INFEASIBLE for).
-    """
+    """LP must agree with MIP on feasibility for absurd NCO 
+    guards against inconsistent "unbounded" (available=inf) cap convention between two solvers (both must cap at 10,000 lots)"""
     assets = build_asset_universe()
     config = OptimizerConfig(net_cash_outflows=1_000_000.0, benchmark_yield=0.085)
 
@@ -118,10 +89,8 @@ def test_lp_relaxation_infeasible_matches_mip_infeasible():
 
 @pytest.mark.parametrize("period_key", list(JPM_PERIODS.keys()))
 def test_lp_relaxation_runs_on_real_jpm_data(period_key):
-    """Smoke test + sanity bounds on real data: must solve OPTIMAL and
-    report a positive marginal cost no larger than the benchmark yield
-    itself (every real hybrid-universe asset has yield_pct=0.0, so the
-    marginal cost can never exceed benchmark_yield - 0)."""
+    """Smoke test, real data: must solve OPTIMAL, marginal cost positive and <= benchmark_yield 
+    (every real asset has yield_pct=0.0)"""
     period = JPM_PERIODS[period_key]
     assets = build_hybrid_asset_universe(period_key)
     nco = net_cash_outflows(period["build_outflows"](), period["build_inflows"]())["net_cash_outflows"]
