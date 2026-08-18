@@ -1,37 +1,19 @@
 """
-LP relaxation of the LCR optimizer, for shadow-price / marginal-cost analysis.
+LP relaxation of LCR optimizer for shadow price / marginal cost analysis
 
-model.py's module docstring flags this explicitly as a deliberate v1 gap:
-CP-SAT is the right choice for the actual allocation decision (integer lot
-counts, reified concentration/lot-size constraints -- see that docstring
-for the full reasoning), but it's a pure integer solver and doesn't expose
-LP dual values the way a continuous solve does. This module is that
-continuous solve: same objective, same constraints, decision variables
-relaxed from integer lot counts to continuous dollar amounts, solved via
-OR-Tools' MPSolver GLOP backend (a true simplex LP solver, which *does*
-have well-defined dual values).
+model.py's CP SAT is right for allocation decision but is a pure integer solver, no LP dual values
+This module: same objective/constraints, lot counts relaxed to continuous $mm, solved via MPSolver GLOP 
+(true simplex, has defined duals)
 
-THE HEADLINE NUMBER this gives you that model.py alone cannot: the dual
-value on the LCR constraint (total adjusted HQLA >= NCO) is the marginal
-annual opportunity cost, in $mm/yr per $1mm of net cash outflows -- i.e.
-d(cost)/d(NCO). That answers a real treasury question the MIP solve can't:
-"what does it cost us, per dollar, to have to cover more net cash
-outflows" -- useful for pricing the cost of a business decision that grows
-the outflow base, or for justifying a request to shrink it.
+HEADLINE NUMBER: dual value on LCR constraint = marginal annual opportunity cost, $mm/yr per $1mm NCO d(cost)/d(NCO)
 
-CAVEATS (say these if asked):
-1. The LP relaxation's optimal objective value is a lower bound on the
-   MIP's (relaxing integrality can only improve or match the true integer
-   optimum), so LP cost <= MIP cost. For large-lot assets relative to the
-   portfolio size this gap is usually small, but it is a real
-   approximation gap, not numerical noise.
-2. "MIP shadow price" isn't a well-defined concept the way an LP dual is
-   (duality theory is an LP/convex-program result) -- this is a genuinely
-   different, complementary analysis, not a more-precise version of the
-   same number the MIP would give you if you asked it nicely.
-3. No SCALE-style integer coefficient scaling is needed here (unlike
-   model.py) -- GLOP is a native floating-point LP solver, so haircuts,
-   rates, and caps enter as exact real coefficients.
+CAVEATS:
+1. LP optimal cost is a lower bound on MIP's (relaxing integrality can only help) 
+    LP cost <= MIP cost, real gap not noise
+2. "MIP shadow price" isn't well defined (duality is an LP/convex-program result) 
+    complementary analysis, not a precise version of one MIP number
+3. No SCALE-style integer scaling needed 
+    GLOP is native floating point
 """
 
 from dataclasses import dataclass, field
@@ -45,24 +27,38 @@ from .model import OptimizerConfig
 
 @dataclass
 class LPAssetResult:
+    """One asset's allocation, LPRelaxationResult
+    Mirrors model.AssetResult, no `lots` (continuous)
+    name/tier/issuer: str
+    amount_mm: float, continuous $mm, not lot-rounded
+    adjusted_mm: float, post-haircut $mm
+    annual_cost_mm: float $mm/yr
+    """
     name: str
     tier: str
     issuer: str
-    amount_mm: float       # continuous $mm, NOT rounded to a lot multiple
-    adjusted_mm: float      # post-haircut, HQLA-eligible value
+    amount_mm: float
+    adjusted_mm: float
     annual_cost_mm: float
 
 
 @dataclass
 class LPRelaxationResult:
+    """Return value of solve_lp_relaxation()
+    status: str, "OPTIMAL"/"FEASIBLE"/"INFEASIBLE"/"UNBOUNDED"/"UNKNOWN"/"SOLVER_UNAVAILABLE"
+    allocations: list[LPAssetResult], empty unless OPTIMAL/FEASIBLE
+    total_hqla_adjusted: float $mm
+    lcr_pct: float
+    total_annual_cost_mm: float $mm/yr
+    All 0.0 if not solved
+    lcr_marginal_cost_mm_per_mm: float|None headline number, dual on LCR constraint, $mm/yr per $1mm NCO; None unless status exactly "OPTIMAL"
+    diagnostics: dict l1/l2a/l2b_adjusted_mm, float $mm
+    """
     status: str
-    allocations: list = field(default_factory=list)   # list[LPAssetResult]
+    allocations: list = field(default_factory=list)
     total_hqla_adjusted: float = 0.0
     lcr_pct: float = 0.0
     total_annual_cost_mm: float = 0.0
-    # $mm/yr of additional cost per additional $1mm of NCO -- the headline
-    # number. None if the LCR constraint wasn't binding / has no valid dual
-    # (e.g. NCO == 0, or the solve wasn't optimal).
     lcr_marginal_cost_mm_per_mm: Optional[float] = None
     diagnostics: dict = field(default_factory=dict)
 
@@ -71,6 +67,13 @@ _L2B_TIERS = ("L2B_RMBS", "L2B_CORP", "L2B_EQUITY")
 
 
 def solve_lp_relaxation(assets: list[Asset], config: OptimizerConfig) -> LPRelaxationResult:
+    """Builds + solves continuous LP relaxation via MPSolver GLOP for LCR constraint's dual value (marginal cost)
+    See module docstring for why this needs a separate solve
+
+    ARGS: assets: list[Asset], same shape as model.solve(). config: OptimizerConfig, same shape
+        note config.time_limit_seconds is ignored (GLOP has no limit set here)
+    RETURNS: LPRelaxationResult
+    """
     solver = pywraplp.Solver.CreateSolver("GLOP")
     if solver is None:
         return LPRelaxationResult(status="SOLVER_UNAVAILABLE")
@@ -80,16 +83,16 @@ def solve_lp_relaxation(assets: list[Asset], config: OptimizerConfig) -> LPRelax
         if a.available is not None and a.available != float("inf"):
             ub = a.available
         else:
-            # Mirrors model.py's build_model(): "unbounded" (available=inf,
-            # e.g. cash) is capped at 10,000 lots for a finite domain, not
-            # actually unlimited. Must match that convention exactly --
-            # an inconsistent cap here would make the LP report OPTIMAL on
-            # an NCO the MIP correctly reports INFEASIBLE for, which would
-            # silently misrepresent what "feasible" means between the two.
+            # Mirrors model.py's build_model(): "unbounded" is capped at 10,000 lots for a finite domain, not actually unlimited
+
             ub = 10_000 * a.min_lot
         amount_vars[a.name] = solver.NumVar(0.0, float(ub), f"amount_{a.name}")
 
     def adjusted_expr(a: Asset):
+        """Post haircut LP expression for one asset
+        ARGS: a: Asset
+        RETURNS: LP expression, 0.0 for non HQLA
+        """
         if not a.is_hqla:
             return 0.0
         return amount_vars[a.name] * (1.0 - a.haircut)
@@ -103,22 +106,22 @@ def solve_lp_relaxation(assets: list[Asset], config: OptimizerConfig) -> LPRelax
     l2b_adj = sum((adjusted_expr(a) for a in l2b_assets), 0.0)
     total_hqla_adj = l1_adj + l2a_adj + l2b_adj
 
-    # --- Constraint 1: LCR >= 100% <=> total adjusted HQLA >= NCO ---
-    # This is the constraint whose dual value is the headline number.
+    # Constraint 1: LCR >= 100% <=> total adjusted HQLA >= NCO 
+    # This is the constraint whose dual value is headline number
     lcr_constraint = solver.Add(total_hqla_adj >= config.net_cash_outflows, "lcr_constraint")
 
-    # --- Constraint 2: Level 2 (2A+2B) <= 40% of total HQLA ---
+    # Constraint 2: Level 2 (2A+2B) <= 40% of total HQLA
     solver.Add(0.60 * (l2a_adj + l2b_adj) <= 0.40 * l1_adj)
 
-    # --- Constraint 3: Level 2B <= 15% of total HQLA ---
+    # Constraint 3: Level 2B <= 15% of total HQLA 
     solver.Add(0.85 * l2b_adj <= 0.15 * (l1_adj + l2a_adj))
 
-    # --- Constraint 4: cash floor ---
+    # Constraint 4: cash floor 
     cash_assets = [a for a in assets if a.tier == "L1" and "Cash" in a.name]
     if config.cash_floor > 0 and cash_assets:
         solver.Add(sum(amount_vars[a.name] for a in cash_assets) >= config.cash_floor)
 
-    # --- Constraint 5 (optional): single-issuer concentration limit ---
+    # Constraint 5 (optional): single issuer concentration limit 
     if config.issuer_concentration_cap:
         cap = config.issuer_concentration_cap
         issuers = sorted(set(a.issuer for a in assets if a.is_hqla))
@@ -126,7 +129,7 @@ def solve_lp_relaxation(assets: list[Asset], config: OptimizerConfig) -> LPRelax
             issuer_adj = sum((adjusted_expr(a) for a in assets if a.issuer == issuer and a.is_hqla), 0.0)
             solver.Add(issuer_adj <= cap * total_hqla_adj)
 
-    # --- Objective: minimize total annual opportunity cost ---
+    # Objective: minimize total annual opportunity cost 
     cost_terms = [
         (config.benchmark_yield - a.yield_pct) * amount_vars[a.name]
         for a in assets
@@ -161,7 +164,7 @@ def solve_lp_relaxation(assets: list[Asset], config: OptimizerConfig) -> LPRelax
     total_hqla = sum(r.adjusted_mm for r in allocations)
     lcr_pct = 100.0 * total_hqla / config.net_cash_outflows if config.net_cash_outflows > 0 else float("inf")
 
-    # dual_value() is only meaningful for a true optimal LP basis.
+    # dual_value() is only meaningful for true optimal LP basis
     lcr_dual = lcr_constraint.dual_value() if status_name == "OPTIMAL" else None
 
     return LPRelaxationResult(
