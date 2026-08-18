@@ -1,20 +1,11 @@
 """
-Validation suite for the real JPMorgan Chase data in data_jpm.py.
+Validation suite for real JPM data in data_jpm.py
 
-The point of this file is narrow but important: data_jpm.py's whole value
-is that its numbers reproduce JPM's own disclosed arithmetic. Nothing in
-Python enforces that at import time -- a typo'd balance or a rate copied
-into the wrong dict would silently produce a plausible-looking but wrong
-NCO/HQLA, and nothing would catch it without these tests. Each check here
-was originally verified by hand in the extraction session; this file locks
-that verification in so a future edit can't quietly regress it.
+data_jpm.py's numbers reproduce JPM's disclosed arithmetic
+nothing enforces that at import time, so these tests lock in what was verified by hand during extraction
 
-Tolerances: JPM discloses whole-$mm figures already rounded from its own
-underlying (unpublished) precision, and rates.py stores each implied rate
-to 4 decimal places -- both introduce a few $mm of rounding noise on
-figures in the hundreds of billions, so comparisons use a relative
-tolerance (pytest.approx's default rel=1e-6 is too tight; these use
-rel=1e-3, i.e. up to 0.1%) rather than exact equality.
+Tolerances: JPM discloses whole-$mm rounded figures, rates.py stores 4 decimals
+both introduce rounding noise, so comparisons use rel=1e-3 (0.1%), not exact equality
 """
 
 import pytest
@@ -31,12 +22,8 @@ PERIOD_KEYS = list(JPM_PERIODS.keys())
 
 @pytest.mark.parametrize("period_key", PERIOD_KEYS)
 def test_net_cash_outflows_matches_jpm_disclosed(period_key):
-    """
-    net_cash_outflows() run over this quarter's real outflow/inflow lines
-    must reproduce JPM's own reported NCO (excluding the maturity-mismatch
-    add-on, which this project doesn't model -- see data_jpm.py's module
-    docstring, limitation 3).
-    """
+    """net_cash_outflows() over real lines must reproduce JPM's reported NCO
+    (excl. maturity-mismatch add-on, not modeled -- limitation 3)"""
     period = JPM_PERIODS[period_key]
     outflows = period["build_outflows"]()
     inflows = period["build_inflows"]()
@@ -53,11 +40,7 @@ def test_net_cash_outflows_matches_jpm_disclosed(period_key):
 
 @pytest.mark.parametrize("period_key", PERIOD_KEYS)
 def test_hqla_universe_matches_jpm_disclosed(period_key):
-    """
-    The real (non-hybrid) HQLA line items -- cash + Level 1 securities +
-    Level 2A securities, each haircut-adjusted -- must sum to JPM's own
-    reported eligible HQLA for the quarter.
-    """
+    """Real HQLA lines (cash + L1 + L2A, haircut-adjusted) must sum to JPM's reported eligible HQLA"""
     period = JPM_PERIODS[period_key]
     disclosed = period["disclosed"]
     hqla = period["build_hqla"]()
@@ -69,12 +52,8 @@ def test_hqla_universe_matches_jpm_disclosed(period_key):
 
 @pytest.mark.parametrize("period_key", PERIOD_KEYS)
 def test_hybrid_universe_preserves_real_tier_totals(period_key):
-    """
-    build_hybrid_asset_universe() rescales the synthetic instrument split
-    to match real tier totals -- confirm that rescaling is lossless (the
-    hybrid universe's total adjusted HQLA still matches JPM's disclosed
-    eligible HQLA, same as the non-hybrid build_hqla_universe_jpm_* does).
-    """
+    """Rescaling in build_hybrid_asset_universe() must be lossless 
+    total adjusted HQLA still matches JPM's disclosed eligible HQLA"""
     period = JPM_PERIODS[period_key]
     disclosed = period["disclosed"]
     assets = build_hybrid_asset_universe(period_key)
@@ -86,8 +65,8 @@ def test_hybrid_universe_preserves_real_tier_totals(period_key):
 
 @pytest.mark.parametrize("period_key", PERIOD_KEYS)
 def test_hybrid_universe_drops_level_2b(period_key):
-    """Both real quarters report $0 average eligible Level 2B HQLA -- the
-    hybrid universe must not contain any Level 2B instrument for either."""
+    """Both quarters report $0 Level 2B 
+    hybrid universe must contain none"""
     assets = build_hybrid_asset_universe(period_key)
     l2b_tiers = {"L2B_RMBS", "L2B_CORP", "L2B_EQUITY"}
     assert not any(a.tier in l2b_tiers for a in assets)
@@ -95,11 +74,8 @@ def test_hybrid_universe_drops_level_2b(period_key):
 
 @pytest.mark.parametrize("period_key", PERIOD_KEYS)
 def test_hybrid_universe_solves_optimal_against_real_nco(period_key):
-    """
-    End-to-end: real outflows/inflows -> real NCO -> hybrid asset universe
-    -> solver. Must be OPTIMAL (real available HQLA comfortably exceeds
-    real NCO for both quarters) and the resulting LCR must be >= 100%.
-    """
+    """End to end: real outflows/inflows -> NCO -> hybrid universe -> solver
+    Must be OPTIMAL, LCR >= 100%"""
     period = JPM_PERIODS[period_key]
     outflows = period["build_outflows"]()
     inflows = period["build_inflows"]()
@@ -111,20 +87,13 @@ def test_hybrid_universe_solves_optimal_against_real_nco(period_key):
 
     assert result.status == "OPTIMAL"
     assert result.lcr_pct >= 100.0 - 1e-6
-    assert result.total_hqla_adjusted == pytest.approx(nco, rel=1e-3)  # solver minimizes down to the floor
+    assert result.total_hqla_adjusted == pytest.approx(nco, rel=1e-3)  # solver minimizes down to floor
 
 
 @pytest.mark.parametrize("period_key", PERIOD_KEYS)
 def test_other_liquidity_sources_present_and_sane(period_key):
-    """
-    Every period must carry an "other_liquidity_sources" entry (used by
-    the contingent-liquidity infeasibility diagnostic in model.py), with
-    positive component values whose sum equals the reported total, and a
-    total roughly in line with JPM's own disclosed order of magnitude
-    (a few hundred billion each for unencumbered securities and FHLB/
-    discount-window capacity, per quarter -- catches a stray extra/missing
-    zero, not just a missing key).
-    """
+    """Every period's other_liquidity_sources (contingent-liquidity diagnostic input) 
+    must have positive components summing to total, magnitude in line with JPM's disclosed order (catches stray zero)"""
     period = JPM_PERIODS[period_key]
     sources = period["other_liquidity_sources"]
 
@@ -137,13 +106,8 @@ def test_other_liquidity_sources_present_and_sane(period_key):
 
 
 def test_hybrid_universe_tight_concentration_cap_is_infeasible_not_crash():
-    """
-    A 25% single-issuer concentration cap is genuinely infeasible against
-    real JPM data (cash + Treasuries alone dominate real HQLA -- see
-    dashboard/app.py's caption on this). Confirm the solver reports
-    INFEASIBLE with a useful diagnostic rather than crashing or silently
-    returning a wrong answer.
-    """
+    """25% concentration cap genuinely infeasible vs. real JPM data (cash + Treasuries dominate)
+    Must return INFEASIBLE with diagnostic, not crash"""
     period_key = "jpm_4q25"
     period = JPM_PERIODS[period_key]
     outflows = period["build_outflows"]()
