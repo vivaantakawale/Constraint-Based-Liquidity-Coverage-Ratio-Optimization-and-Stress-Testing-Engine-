@@ -1,6 +1,6 @@
 """
-Basel III LCR regulatory parameters (BCBS238, "Basel III: The Liquidity
-Coverage Ratio and liquidity risk monitoring tools", Jan 2013).
+Basel III LCR regulatory parameters 
+(BCBS238, "Basel III: Liquidity Coverage Ratio and liquidity risk monitoring tools", Jan 2013)
 
 Every rate below is cited to a paragraph in BCBS238. Where a jurisdiction
 (US, EU) has since diverged from the Basel baseline in its own final rule,
@@ -8,22 +8,25 @@ that is noted -- we implement the BCBS baseline, not any single regulator's
 transposition, since this is a teaching/portfolio project, not a compliance
 system. This distinction is worth stating up front in an interview.
 
-Two variants of the retail run-off numbers exist in practice: BCBS238 itself
-sets a *minimum* of 5% (stable, insured) / 10% (less stable) at the
-international-standard level (para 48-50), while several national regulators
-(e.g. the US NPR) permit an even lower 3% for a subset of "fully insured,
-transactional" deposits. We use the BCBS238 minimums (5%/10%) as the
-defensible baseline and flag the 3% variant here so it's not a surprise if
-asked.
+Two variants of retail run-off numbers exist in practice: BCBS238 sets
+*minimum* 5% (stable) / 10% (less stable) internationally (para 48-50);
+some regulators (e.g. US NPR) permit 3% for "fully insured, transactional"
+deposits. We use BCBS238 minimums (5%/10%) as baseline.
+
+No functions here -- constants only. Exports:
+  HAIRCUTS: dict[str,float]  tier -> haircut.
+  L2_CAP_OF_TOTAL_HQLA / L2B_CAP_OF_TOTAL_HQLA: float  0.40 / 0.15.
+  OUTFLOW_RATES / INFLOW_RATES: dict[str,float]  category -> rate (BCBS238 + real JPM quarters merged).
+  INFLOW_CAP_OF_OUTFLOWS: float  0.75.
+  JPM_<Q><YY>_OUTFLOW_RATES / _INFLOW_RATES: dict[str,float]  per-quarter real rates, folded
+    into OUTFLOW_RATES/INFLOW_RATES via .update().
+
+data.py's OutflowLine.rate / InflowLine.rate read OUTFLOW_RATES/INFLOW_RATES
+by category key -- every key used in data.py/data_jpm.py must exist here.
 """
 
-from dataclasses import dataclass
-
-# ---------------------------------------------------------------------------
 # HQLA tiers: haircuts and composition caps (BCBS238 paras 24-33, 39-40)
-# ---------------------------------------------------------------------------
-
-# Haircuts applied to market value to get the HQLA-eligible ("adjusted") value.
+# Haircuts applied to market value to get the HQLA-eligible ("adjusted") value
 HAIRCUTS = {
     "L1": 0.00,        # Level 1: cash, CB reserves, 0%-risk-weighted sovereign debt (para 24-25)
     "L2A": 0.15,       # Level 2A: 20%-risk-weighted sovereign/PSE debt, AA-/better corporate debt (para 31)
@@ -32,8 +35,8 @@ HAIRCUTS = {
     "L2B_EQUITY": 0.50,  # Level 2B: qualifying common equity shares (para 33(c))
 }
 
-# Composition caps, applied to *total HQLA after haircuts* (para 39-40).
-# NOTE (simplifying assumption): the Basel text defines these via a
+# Composition caps, applied to *total HQLA after haircuts* (para 39-40)
+# NOTE (simplifying assumption): Basel text defines these via
 # sequential "Adjusted Amount" algorithm in Annex 1 because the regulatory
 # reporting formula has to resolve a circular definition (the cap is a % of
 # a total that includes the capped items) without an optimizer. Here we
@@ -45,11 +48,9 @@ HAIRCUTS = {
 L2_CAP_OF_TOTAL_HQLA = 0.40   # Level 2 (2A + 2B combined) <= 40% of total HQLA
 L2B_CAP_OF_TOTAL_HQLA = 0.15  # Level 2B alone <= 15% of total HQLA
 
-# ---------------------------------------------------------------------------
 # Cash outflow run-off rates (BCBS238 paras 47-116)
-# ---------------------------------------------------------------------------
 # Keys here are the liability/exposure "category" a synthetic balance-sheet
-# line item is tagged with in data.py.
+# line item is tagged with in data.py
 
 OUTFLOW_RATES = {
     # Retail deposits (para 48-50)
@@ -74,9 +75,7 @@ OUTFLOW_RATES = {
     "facility_financial": 0.40,
 }
 
-# ---------------------------------------------------------------------------
 # Cash inflow rates (BCBS238 paras 143-160) and the inflow cap (para 143)
-# ---------------------------------------------------------------------------
 
 INFLOW_RATES = {
     "retail_sme_loans": 0.50,          # para 156
@@ -87,12 +86,10 @@ INFLOW_RATES = {
     "committed_facilities_to_bank": 0.00,  # cannot count facilities extended TO you (para 155)
 }
 
-# Total inflows are capped at 75% of total (stressed) outflows (para 143).
+# Total inflows are capped at 75% of total (stressed) outflows (para 143)
 INFLOW_CAP_OF_OUTFLOWS = 0.75
 
-# ---------------------------------------------------------------------------
-# JPMorgan Chase & Co. -- REAL, publicly disclosed 4Q25 LCR rates.
-# ---------------------------------------------------------------------------
+# JPMorgan Chase & Co. -- REAL, publicly disclosed 4Q25 LCR rates
 # Unlike OUTFLOW_RATES/INFLOW_RATES above (which are cited to BCBS238
 # paragraphs), every rate here is *implied*, computed as
 # (average weighted amount / average unweighted amount) from JPMorganChase's
@@ -138,14 +135,13 @@ JPM_4Q25_INFLOW_RATES = {
 OUTFLOW_RATES.update(JPM_4Q25_OUTFLOW_RATES)
 INFLOW_RATES.update(JPM_4Q25_INFLOW_RATES)
 
-# ---------------------------------------------------------------------------
-# JPMorgan Chase & Co. -- REAL, publicly disclosed 1Q26 LCR rates.
-# ---------------------------------------------------------------------------
+# JPMorgan Chase & Co. -- REAL, publicly disclosed 1Q26 LCR rates
+
 # Same derivation and same caveats as the 4Q25 block above, source is
 # JPMorganChase, "Liquidity Coverage Ratio Disclosure," quarterly period
 # ended March 31, 2026 ("1Q26 LCR Report"), page 2 table. Kept as a
 # separate quarter (distinct key prefix) rather than overwriting 4Q25, so
-# both quarters remain independently usable/comparable.
+# both quarters remain independently usable/comparable
 JPM_1Q26_OUTFLOW_RATES = {
     "jpm_1q26_stable_retail_deposits": 0.0300,          # 20,459 / 681,976
     "jpm_1q26_other_retail_funding": 0.1132,            # 48,020 / 424,121
@@ -173,9 +169,8 @@ JPM_1Q26_INFLOW_RATES = {
 OUTFLOW_RATES.update(JPM_1Q26_OUTFLOW_RATES)
 INFLOW_RATES.update(JPM_1Q26_INFLOW_RATES)
 
-# ---------------------------------------------------------------------------
-# JPMorgan Chase & Co. -- REAL, publicly disclosed 2Q25 LCR rates.
-# ---------------------------------------------------------------------------
+# JPMorgan Chase & Co. -- REAL, publicly disclosed 2Q25 LCR rates
+
 # Source: "Liquidity Coverage Ratio Disclosure," quarterly period ended
 # June 30, 2025 ("2Q25 LCR Report"), page 2 table. Same derivation/caveats
 # as the 4Q25 block above.
@@ -206,12 +201,11 @@ JPM_2Q25_INFLOW_RATES = {
 OUTFLOW_RATES.update(JPM_2Q25_OUTFLOW_RATES)
 INFLOW_RATES.update(JPM_2Q25_INFLOW_RATES)
 
-# ---------------------------------------------------------------------------
-# JPMorgan Chase & Co. -- REAL, publicly disclosed 3Q25 LCR rates.
-# ---------------------------------------------------------------------------
+# JPMorgan Chase & Co. -- REAL, publicly disclosed 3Q25 LCR rates
+
 # Source: "Liquidity Coverage Ratio Disclosure," quarterly period ended
-# September 30, 2025 ("3Q25 LCR Report"), page 2 table. Same
-# derivation/caveats as the 4Q25 block above.
+# September 30, 2025 ("3Q25 LCR Report"), page 2 table
+# SamE derivation/caveats as 4Q25 block above
 JPM_3Q25_OUTFLOW_RATES = {
     "jpm_3q25_stable_retail_deposits": 0.0300,          # 20,108 / 670,253
     "jpm_3q25_other_retail_funding": 0.1136,            # 45,503 / 400,388
@@ -238,16 +232,3 @@ JPM_3Q25_INFLOW_RATES = {
 
 OUTFLOW_RATES.update(JPM_3Q25_OUTFLOW_RATES)
 INFLOW_RATES.update(JPM_3Q25_INFLOW_RATES)
-
-
-@dataclass(frozen=True)
-class RegulatoryConfig:
-    """Bundles the constants above so the model module takes one object."""
-    haircuts: dict
-    l2_cap: float = L2_CAP_OF_TOTAL_HQLA
-    l2b_cap: float = L2B_CAP_OF_TOTAL_HQLA
-    inflow_cap_of_outflows: float = INFLOW_CAP_OF_OUTFLOWS
-
-    @classmethod
-    def basel_baseline(cls):
-        return cls(haircuts=dict(HAIRCUTS))
