@@ -1,45 +1,9 @@
 """
-Real JPMorgan Chase & Co. regulatory capital data (Basel III Pillar 3),
-extracted from public filings. Companion to data_jpm.py's LCR-side real
-data -- same "real numbers where disclosed, honestly scoped where not"
-approach, applied to the capital-adequacy side of the balance sheet.
+Real JPMorgan Chase regulatory capital data (Basel III Pillar 3) from public filings
+Companion to data_jpm.py's LCR-side data
 
-WHY THIS EXISTS: data_jpm.py's module docstring flagged the 4Q25 Pillar 3
-Report as "kept here only as a cross-reference for a future capital-
-adequacy module" -- this is that module.
-
-WHY IT'S A REPORTING LAYER, NOT AN OPTIMIZER CONSTRAINT: LCR and capital
-adequacy are two independent Basel III pillars with different denominators
-(net cash outflows vs. risk-weighted assets / leverage exposure). There is
-no meaningful optimization decision connecting them in this project's
-scope -- the HQLA portfolio being sized here (on the order of $0.8-1.6T of
-net cash outflows, see data_jpm.py) is a small fraction of JPM's ~$2.0-2.1T
-total RWA and ~$5.3-5.6T total leverage exposure. To see whether it could
-ever bind: JPM's actual capital conservation buffer / SLR buffer above its
-regulatory floor (see compute_capital_adequacy() below) each represent on
-the order of $50-150bn of headroom at 4Q25/1Q26 -- far larger than any
-plausible swing in the LCR-sized HQLA portfolio modeled elsewhere in this
-project could move. Bolting an SLR/RWA constraint onto model.py's
-optimizer would therefore be a constraint that can never bind given this
-project's actual numbers -- exactly the kind of decorative-but-inert
-feature this project has otherwise avoided. This module instead does what
-data_jpm.py does for LCR: extract JPM's real disclosed capital figures and
-cross-validate that recomputing the ratios from raw dollar amounts
-reproduces JPM's own reported percentages.
-
-DATA AVAILABILITY: only 4Q25 and 1Q26 are covered here, because those are
-the only two quarters for which the full Pillar 3 Regulatory Capital
-Disclosures Report was provided (2Q25/3Q25's Pillar 3 reports were never
-supplied -- only their LCR Disclosure reports were, which is why
-data_jpm.py's LCR-side data covers all 4 quarters but this module covers
-only 2). Do not add 2Q25/3Q25 entries here without the actual source
-document -- extrapolating capital figures from unrelated quarters would
-violate this project's real-data-only rule for JPM-specific numbers.
-
-Sources: JPMorganChase, "Pillar 3 Regulatory Capital Disclosures," for the
-quarterly periods ended December 31, 2025 ("4Q25 Pillar 3 Report") and
-March 31, 2026 ("1Q26 Pillar 3 Report"). All $ in millions unless noted.
-Figures are JPMorgan Chase & Co. (the Firm), not JPMorgan Chase Bank, N.A.
+DATA AVAILABILITY: 4Q25/1Q26 - only quarters with a full Pillar 3 report provided 
+(2Q25/3Q25 only had LCR Disclosure reports)
 """
 
 from dataclasses import dataclass
@@ -104,7 +68,7 @@ JPM_1Q26_CAPITAL = {
         "tier1_min": 13.0,
         "total_capital_min": 15.0,
         "tier1_leverage_min": 4.0,
-        "slr_min": 4.3,   # 3.0% base + 1.25% eSLR buffer for BHC, early-adopted 1/1/2026 [1Q26 P3 p.6]
+        "slr_min": 4.3,   # 3.0% base + 1.25% eSLR buffer for BHC, early adopted 1/1/2026 [1Q26 P3 p.6]
     },
     "tlac": {
         "external_tlac_bn": 572.0,
@@ -124,6 +88,14 @@ JPM_CAPITAL_PERIODS = {
 
 @dataclass
 class CapitalAdequacyResult:
+    """Return value of compute_capital_adequacy()
+    period_key: str. as_of: str, quarter-end date
+    cet1/tier1/total_capital_ratio_pct: float %, capital/RWA
+    tier1_leverage_ratio_pct: float %, Tier1/adjusted avg assets
+    slr_pct: float %, Tier1/leverage exposure
+    *_surplus_pct: float, ratio minus regulatory minimum, pct points; negative = below requirement
+    all_requirements_met: bool, True iff every surplus >= 0
+    """
     period_key: str
     as_of: str
     cet1_ratio_pct: float
@@ -131,7 +103,7 @@ class CapitalAdequacyResult:
     total_capital_ratio_pct: float
     tier1_leverage_ratio_pct: float
     slr_pct: float
-    cet1_surplus_pct: float          # ratio - requirement, in percentage points
+    cet1_surplus_pct: float
     tier1_surplus_pct: float
     total_capital_surplus_pct: float
     tier1_leverage_surplus_pct: float
@@ -141,11 +113,10 @@ class CapitalAdequacyResult:
 
 def compute_capital_adequacy(period_key: str) -> CapitalAdequacyResult:
     """
-    Recomputes each capital ratio from raw dollar amounts (not simply
-    echoing JPM's disclosed percentages) -- this is the same "reproduce,
-    don't just repeat" validation discipline data_jpm.py applies to
-    NCO/HQLA. See tests/test_capital.py for the check that this matches
-    JPM's own disclosed ratios.
+    Recomputes each ratio from raw dollar amounts while not echoing disclosed percentages
+
+    ARGS: period_key: str -- JPM_CAPITAL_PERIODS key ("jpm_4q25"/"jpm_1q26"), raises KeyError otherwise
+    RETURNS: CapitalAdequacyResult
     """
     d = JPM_CAPITAL_PERIODS[period_key]
     req = d["requirements_bhc_pct"]
