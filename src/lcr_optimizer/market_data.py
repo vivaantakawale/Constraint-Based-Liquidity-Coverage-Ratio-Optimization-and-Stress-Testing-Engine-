@@ -1,19 +1,14 @@
 """
-Optional live market-data fetch for the *cost side* of the objective.
+Optional live market data fetch for cost side of objective
 
-The balance sheet and asset universe in data.py are synthetic (no real bank's
-numbers), but there's no reason the Treasury yields we price Level 1 assets
-off of need to be made up too -- the US Treasury publishes the daily par
-yield curve for free, no API key required. This module fetches it; if the
-network call fails (offline, firewalled, etc.) it falls back to a hardcoded
-snapshot so the rest of the project still runs deterministically.
+Falls back to hardcoded snapshot on network failure
 
 Source: US Treasury "Daily Treasury Par Yield Curve Rates" XML feed.
 https://home.treasury.gov/resource-center/data-chart-center/interest-rates/pages/xml
 """
 
 import re
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 
 import requests
 
@@ -22,7 +17,10 @@ TREASURY_XML_URL = (
     "?data=daily_treasury_yield_curve&field_tdr_date_value_month={yyyymm}"
 )
 
-# Fallback snapshot (approx late-2025 levels) used if the live fetch fails.
+# Fallback snapshot used if the live fetch fails
+# Captured date mentioned
+
+FALLBACK_YIELDS_AS_OF = "2025-12"
 FALLBACK_YIELDS = {
     "UST_1M": 0.042,
     "UST_2Y": 0.038,
@@ -36,26 +34,31 @@ _FIELD_TO_KEY = {
 
 def fetch_treasury_yields(timeout: float = 5.0) -> dict:
     """
-    Returns {"UST_1M": 0.0421, "UST_2Y": 0.0383, ...} as decimals.
-    Falls back to FALLBACK_YIELDS (with a warning) on any failure.
+    Fetches latest 1-month/2-year US Treasury par yields from Treasury.gov XML feed
+    retries previous month if current empty
+    falls back to FALLBACK_YIELDS on network error/bad status/unparseable feed
+
+    ARGS: timeout: float - seconds before requests.get() times out, default 5.0
+    RETURNS: dict[str, float|str] - "UST_1M"/"UST_2Y": float decimal yield
+        "_source": str, "live:treasury.gov" or fallback message with exception detail
     """
-    yyyymm = datetime.utcnow().strftime("%Y%m")
+    now = datetime.now(timezone.utc)
+    yyyymm = now.strftime("%Y%m")
     url = TREASURY_XML_URL.format(yyyymm=yyyymm)
     try:
         resp = requests.get(url, timeout=timeout)
         resp.raise_for_status()
         xml = resp.text
 
-        # If the current month has no published data yet (e.g. first day of
-        # the month), fall back to the previous month before giving up.
+        # If current month has no published data yet fall back to previous month before giving up
         if "<entry>" not in xml:
-            prev_month = (datetime.utcnow().replace(day=1) - timedelta(days=1)).strftime("%Y%m")
+            prev_month = (now.replace(day=1) - timedelta(days=1)).strftime("%Y%m")
             url = TREASURY_XML_URL.format(yyyymm=prev_month)
             resp = requests.get(url, timeout=timeout)
             resp.raise_for_status()
             xml = resp.text
 
-        # Take the LAST <entry> in the feed (most recent trading day).
+        # Take LAST <entry> in feed (most recent trading day)
         entries = xml.split("<entry>")
         last_entry = entries[-1]
 
@@ -75,7 +78,9 @@ def fetch_treasury_yields(timeout: float = 5.0) -> dict:
 
     except Exception as exc:
         result = dict(FALLBACK_YIELDS)
-        result["_source"] = f"fallback (live fetch failed: {exc})"
+        result["_source"] = (
+            f"fallback as of {FALLBACK_YIELDS_AS_OF} (live fetch failed: {exc})"
+        )
         return result
 
 
